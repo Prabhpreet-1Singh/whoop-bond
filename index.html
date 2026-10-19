@@ -24,14 +24,14 @@
 </head>
 <body>
 <h1>WHOOP Bond Test</h1>
-<p class="sub">Bonds this iPhone to the strap, sends CLIENT_HELLO, and checks whether history records come through. Data stays on this phone.</p>
+<p class="sub">Keep this screen on during a long drain (Settings › Display › Auto-Lock › Never). Bonds this iPhone to the strap, sends CLIENT_HELLO, and checks whether history records come through. Data stays on this phone.</p>
 
 <div class="card" id="support"></div>
 
 <div class="card">
   <button id="bConnect">1 · Connect &amp; bond</button>
   <button id="bPeek" class="sec" disabled>2 · Peek history (read-only)</button>
-  <label>Batches to acknowledge <input id="nBatches" type="number" value="5" min="1" max="500"></label>
+  <label>Batches to acknowledge <input id="nBatches" type="number" value="3000" min="1" max="5000"></label>
   <button id="bDrain" class="sec" disabled>3 · Drain (acknowledges data)</button>
   <button id="bCopy" class="sec">Copy full log</button>
 </div>
@@ -45,6 +45,7 @@
   <div class="row"><span>Record versions</span><span id="sVer">—</span></div>
   <div class="row"><span>Events / logs</span><span id="sEv">0 / 0</span></div>
   <div class="row"><span>Batches acked</span><span id="sAck">0</span></div>
+  <div class="row"><span>Backlog reached</span><span id="sDate">—</span></div>
   <div class="row"><span>Strap PullStats</span><span id="sPull">—</span></div>
   <div class="row"><span>Live HR</span><span id="sHR">—</span></div>
 </div>
@@ -142,9 +143,15 @@ function onFrame(f, raw, ch) {
       else if (!$("sSerial").textContent.match(/\d/)) setStat("sHello", "empty reply", "warn");
     } else log(`response cmd ${cmd}: result byte ${p[1]} (${hex(p.subarray(0, 6))})`);
   } else if (pt === 47) {
+    if (rec === 0) log("FIRST HISTORY RECORD (type 47, v" + seq + ")", "ok");
     rec++; versions[seq] = (versions[seq] || 0) + 1;
+    $("sRec").className = "ok";
   } else if (pt === 48) {
     events++;
+    if (p.length >= 5) {                       // event timestamp: u32 LE at payload[1..5]
+      const t = (p[1] | (p[2] << 8) | (p[3] << 16) | (p[4] << 24)) >>> 0;
+      if (t > 1.6e9 && t < 2.1e9) $("sDate").textContent = new Date(t * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    }
   } else if (pt === 49 || pt === 56) {
     const kind = [1, 2, 3].includes(cmd) ? cmd : p[0];
     if (kind === 2 && p.length >= 18) {
@@ -231,7 +238,7 @@ $("bPeek").onclick = async () => {
 
 $("bDrain").onclick = async () => {
   if (!confirm("Acknowledged batches are marked as read on the strap. Continue?")) return;
-  const max = Math.max(1, +$("nBatches").value || 5);
+  const max = Math.max(1, +$("nBatches").value || 3000);
   let done = false; completeWaiter = () => (done = true);
   await startHistory();
   let n = 0, last = Date.now(), seen = 0;
