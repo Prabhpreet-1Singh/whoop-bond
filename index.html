@@ -51,8 +51,8 @@
     <div class="card"><div class="rings">
       <div class="ring" id="rRec"></div><div class="ring" id="rStrain"></div><div class="ring" id="rSleep"></div>
     </div></div>
+    <div class="card"><h2>Heart rate · last 24 h</h2><canvas id="cToday" height="140"></canvas></div>
     <div class="grid" id="todayTiles"></div>
-    <div class="card" style="margin-top:12px"><h2>Heart rate</h2><canvas id="cToday" height="170"></canvas></div>
   </section>
 
   <!-- SLEEP -->
@@ -60,7 +60,7 @@
     <h1>Sleep</h1>
     <p class="sub" id="sleepSub">—</p>
     <div class="grid" id="sleepTiles"></div>
-    <div class="card" style="margin-top:12px"><h2>Heart rate &amp; movement overnight</h2><canvas id="cSleep" height="190"></canvas>
+    <div class="card" style="margin-top:12px"><h2>Heart rate &amp; movement overnight</h2><canvas id="cSleep" height="150"></canvas>
       <p class="note">Line: heart rate. Bars: wrist movement. Sleep stages are not shown — they can't be estimated reliably from this data.</p></div>
   </section>
 
@@ -81,6 +81,7 @@
       <div class="bar"><i id="pbar"></i></div>
       <div class="row"><span>Status</span><span id="sStatus">idle</span></div>
       <div class="row"><span>Strap</span><span id="sStrap">—</span></div>
+      <div class="row"><span>Strap battery</span><span id="sBatt">—</span></div>
       <div class="row"><span>Backlog reached</span><span id="sDate">—</span></div>
       <div class="row"><span>Records saved this sync</span><span id="sNew">0</span></div>
       <div class="row"><span>Records on this phone</span><span id="sTotal">—</span></div>
@@ -108,6 +109,7 @@
       <label class="f">Height (cm) <input id="pHeight" type="number"></label>
       <label class="f">Max HR (0 = auto) <input id="pMaxHR" type="number"></label>
       <label class="f">Sleep need (h) <input id="pSleep" type="number" step="0.5"></label>
+      <label class="f">Step calibration (×) <input id="pStep" type="number" step="0.05"></label>
       <button id="bSaveProfile">Save</button>
     </div>
     <div class="card method">
@@ -115,13 +117,15 @@
       <h3>Data</h3><p>Per-second records pulled from the strap's own memory over Bluetooth: heart rate, beat-to-beat (R-R) intervals, wrist orientation, skin temperature. Nothing leaves this phone.</p>
       <h3>HRV</h3><p>RMSSD of clean R-R intervals (300–2000 ms, &lt;20% change between beats) in 5-minute windows during sleep; nightly value = median window.</p>
       <h3>Resting HR</h3><p>Lowest 10-minute average heart rate during sleep.</p>
-      <h3>Sleep</h3><p>Main sleep window from heart rate (longest period well below your awake level, ≥3 h); minutes with wrist movement are counted as awake. No sleep stages.</p>
+      <h3>Sleep</h3><p>Uses the strap's own per-second sleep/wake flag when present (longest asleep stretch, gaps ≤30 min bridged, ≥2 h); otherwise heart rate (longest period well below your awake level, ≥3 h) with wrist movement counted as awake. No sleep stages.</p>
       <h3>Recovery</h3><p>This app's formula on WHOOP's inputs: today's HRV and resting HR vs your previous 30 days (z-scores), 0.65·HRV − 0.35·RHR, mapped to 1–99%. Needs 4 nights to calibrate. Not WHOOP's proprietary score.</p>
       <h3>Strain</h3><p>Edwards TRIMP (minutes per heart-rate zone × 1…5), mapped to 0–21 as 21·(1 − e^(−TRIMP/200)).</p>
-      <h3>Calories</h3><p>BMR (Mifflin–St Jeor) at rest; Keytel 2005 heart-rate equation above 30% heart-rate reserve. Roughly ±10–20%.</p>
+      <h3>Calories</h3><p>BMR (Mifflin–St Jeor) for every minute; Keytel 2005 heart-rate equation for minutes above 50% heart-rate reserve (real exercise). Today's figure counts the day so far. Roughly ±10–20%.</p>
       <h3>VO₂max</h3><p>Uth 2004: 15.3 × max HR ÷ resting HR. Population estimate.</p>
       <h3>Skin temp</h3><p>Deviation from your 30-day baseline during sleep. Relative trend, not a medical temperature.</p>
-      <h3>Activity count</h3><p>The strap's own on-board movement counter (likely steps; not yet validated against a known step count).</p>
+      <h3>Steps</h3><p>The strap's own cumulative step/motion counter (byte 57), summed per day, ignoring resets. Calibrate in Profile: walk 100 counted steps, then set the factor to 100 ÷ what the app showed.</p>
+      <h3>Fitness age</h3><p>Nes et al. 2011 (HUNT study) fitness-age equation from your median resting HR, with activity assumed average. Needs 7 nights. A fitness comparison, not a biological age.</p>
+      <h3>Credits</h3><p>Record layout cross-checked with the open-source NOOP project (sleep flag, motion, step counter, skin temp) and whoop-vault (protocol).</p>
     </div>
   </section>
 </main>
@@ -185,15 +189,21 @@ class Assembler {
   }
 }
 // Version-18 biometric record (offsets into the full frame, verified on this strap's data):
-//   15 u32 timestamp · 22 HR · 23 R-R count · 24.. R-R u16 (ms) · 45 gravity 3×f32 · 57 u16 movement counter · 73 u16 skin temp ×0.01 °C
+//   15 u32 timestamp · 22 HR · 23 R-R count · 24.. R-R u16 (ms) · 41 f32 dynamic acceleration (g) · 45 gravity 3×f32
+//   57 u16 cumulative step/motion counter · 63 activity class (0 still, 1 walk, 2 run) · 73 u16 skin temp ×0.01 °C
+//   81 band flags: bits 4-5 strap sleep state (0 wake, 1 still, 2 asleep, 3 up), bits 0-1 on-wrist
+//   Field map cross-checked with NOOP (vishk23/noop HistoricalStreams.kt, ~18.6k real records, 3 straps).
 function parseV18(raw) {
   if (raw.length < 80) return null;
   const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const n = Math.min(raw[23], 4), rr = [];
   for (let i = 0; i < n; i++) rr.push(dv.getUint16(24 + 2 * i, true));
   const r3 = (x) => Math.round(x * 1000) / 1000;
+  const da = dv.getFloat32(41, true), act = raw[63], fl = raw[81];
   return { t: dv.getUint32(15, true), hr: raw[22], rr, g: [r3(dv.getFloat32(45, true)), r3(dv.getFloat32(49, true)), r3(dv.getFloat32(53, true))],
-           c: dv.getUint16(57, true), st: dv.getUint16(73, true) / 100 };
+           c: dv.getUint16(57, true), st: dv.getUint16(73, true) / 100,
+           da: Number.isFinite(da) && da >= 0 && da <= 8 ? Math.round(da * 10000) / 10000 : null,
+           act: act <= 2 ? act : null, ss: (fl >> 4) & 3, ow: fl & 3 };
 }
 /*PROTOCOL-END*/
 
@@ -236,10 +246,11 @@ const HRV = {
 };
 const maxHR = (p) => (p.maxHR > 0 ? p.maxHR : 208 - 0.7 * p.age);
 const Energy = {
+  ACTIVE_HRR: 0.5, // "active" above 50% heart-rate reserve (same day-level gate NOOP uses)
   bmr(p) { const b = 10 * p.weight + 6.25 * p.height - 5 * p.age; return p.sex === "male" ? b + 5 : b - 161; },
   keytel(hr, p) { const kj = p.sex === "male" ? -55.0969 + 0.6309 * hr + 0.1988 * p.weight + 0.2017 * p.age : -20.4022 + 0.4472 * hr - 0.1263 * p.weight + 0.074 * p.age; return kj / 4.184; },
   calories(minutes, period, rhr, p) {
-    const bm = Energy.bmr(p) / 1440, r = rhr ?? 60, thr = r + 0.3 * (maxHR(p) - r);
+    const bm = Energy.bmr(p) / 1440, r = rhr ?? 60, thr = r + Energy.ACTIVE_HRR * (maxHR(p) - r);
     let tot = 0, n = 0;
     for (const m of minutes) { n++; tot += m.bpm >= thr ? Math.max(bm, Energy.keytel(m.bpm, p)) : bm; }
     tot += Math.max(0, period - n) * bm;
@@ -289,7 +300,23 @@ const Sleep = {
     return best;
   },
 };
-const Fitness = { vo2(mx, rhr) { return rhr > 25 ? 15.3 * mx / rhr : null; } };
+const Fitness = {
+  vo2(mx, rhr) { return rhr > 25 ? 15.3 * mx / rhr : null; },
+  // Nes et al. 2011 (HUNT) self-consistent fitness age with the physical-activity index held at the
+  // population reference (5) — i.e. driven by resting HR only. Clamped 20–80.
+  fitnessAge(age, sex, rhr) {
+    const [ageC, rhrC] = sex === "female" ? [0.247, 0.114] : [0.296, 0.155];
+    return Math.max(20, Math.min(80, age + (rhrC * (rhr - 65)) / ageC));
+  },
+};
+const Steps = {
+  MAX_DELTA: 512, // a jump this big between adjacent seconds is a gap/reset, not motion
+  ticks(secs) { // secs sorted by t, each with c (u16 cumulative counter)
+    let total = 0, prev = null;
+    for (const s of secs) { if (s.c == null) continue; if (prev != null) { const d = (s.c - prev) & 0xFFFF; if (d >= 1 && d < Steps.MAX_DELTA) total += d; } prev = s.c; }
+    return total;
+  },
+};
 const Recovery = {
   compute(hrv, rhr, bHRV, bRHR) {
     const have = Math.min(bHRV.length, bRHR.length);
@@ -301,10 +328,12 @@ const Recovery = {
 };
 // Aggregates per-second rows into per-minute HR and motion (mean angle change of the gravity vector, deg/s).
 function minutesFrom(secs) {
-  const hr = new Map(), mv = new Map(); let prev = null;
+  const hr = new Map(), mv = new Map(), da = new Map(), ss = new Map(); let prev = null;
   for (const s of secs) {
     const m = Math.floor(s.t / 60);
     if (s.hr > 0) { const a = hr.get(m) || [0, 0]; a[0] += s.hr; a[1]++; hr.set(m, a); }
+    if (s.da != null) { const a = da.get(m) || [0, 0]; a[0] += s.da; a[1]++; da.set(m, a); }
+    if (s.ss != null) { const a = ss.get(m) || [0, 0, 0, 0]; a[s.ss]++; ss.set(m, a); }
     if (s.g && prev && prev.g && s.t - prev.t <= 2) {
       const [x, y, z] = s.g, [u, v, w] = prev.g, n1 = Math.hypot(x, y, z), n2 = Math.hypot(u, v, w);
       if (n1 > 0.5 && n2 > 0.5) {
@@ -316,23 +345,44 @@ function minutesFrom(secs) {
   }
   const minutes = [...hr.entries()].sort((a, b) => a[0] - b[0]).map(([m, [s, n]]) => ({ m, bpm: s / n }));
   const motion = new Map([...mv.entries()].map(([m, [s, n]]) => [m, s / n]));
-  return { minutes, motion };
+  const accel = new Map([...da.entries()].map(([m, [s, n]]) => [m, s / n]));
+  const state = new Map([...ss.entries()].map(([m, c]) => [m, c.indexOf(Math.max(...c))]));
+  return { minutes, motion, accel, state };
 }
-const MOVE_AWAKE = 3; // deg/s mean wrist rotation in a minute → counted awake
+const MOVE_AWAKE = 3; // deg/s mean wrist rotation in a minute → counted awake (fallback when no strap state)
+// Main sleep from the strap's own per-second band state (2 = asleep). Longest run of asleep minutes,
+// bridging non-asleep gaps ≤ 30 min; needs ≥ 120 asleep minutes. Returns null if the night has too few states.
+function bandSleep(state, ws, we, maxGap = 30, minAsleep = 120) {
+  let have = 0; for (let m = ws; m < we; m++) if (state.has(m)) have++;
+  if (have < 180) return null;
+  let best = null, rs = null, last = -1, c = 0;
+  const close = () => { if (rs != null && c > (best ? best.c : 0)) best = { s: rs, e: last + 1, c }; rs = null; c = 0; };
+  for (let m = ws; m < we; m++) {
+    if (state.get(m) === 2) { if (rs != null && m - last - 1 > maxGap) close(); if (rs == null) rs = m; last = m; c++; }
+  }
+  close();
+  if (!best || best.c < minAsleep) return null;
+  return { start: best.s, end: best.e, asleep: best.c, source: "strap" };
+}
 function analyzeDay(dayStartSec, nowSec, secs, profile, prior) {
   const nightStart = dayStartSec - 6 * 3600, nightEnd = Math.min(dayStartSec + 14 * 3600, nowSec);
   const dayEnd = Math.min(dayStartSec + 86400, nowSec);
   const night = secs.filter((s) => s.t >= nightStart && s.t < nightEnd);
   const day = secs.filter((s) => s.t >= dayStartSec && s.t < dayEnd);
   const N = minutesFrom(night), D = minutesFrom(day);
-  const sleep = Sleep.detect(N.minutes, Math.floor(nightStart / 60), Math.floor(Math.max(nightStart, nightEnd) / 60));
+  const nws = Math.floor(nightStart / 60), nwe = Math.floor(Math.max(nightStart, nightEnd) / 60);
+  let sleep = bandSleep(N.state, nws, nwe);
+  if (!sleep) { sleep = Sleep.detect(N.minutes, nws, nwe); if (sleep) sleep.source = "heart rate"; }
   let rhr = null, hrv = null, perf = null, awakeMin = null, temp = null;
   if (sleep) {
     rhr = Sleep.restingHR(N.minutes, sleep.start, sleep.end);
     const rr = []; for (const s of night) if (s.t >= sleep.start * 60 && s.t < sleep.end * 60) for (const ms of s.rr || []) rr.push({ t: s.t, ms });
     hrv = Stats.median(HRV.windowed(rr, sleep.start * 60, sleep.end * 60));
-    awakeMin = 0; for (let m = sleep.start; m < sleep.end; m++) if ((N.motion.get(m) || 0) > MOVE_AWAKE) awakeMin++;
-    sleep.asleep = Math.max(0, Math.min(sleep.asleep, sleep.end - sleep.start - awakeMin));
+    if (sleep.source === "strap") awakeMin = sleep.end - sleep.start - sleep.asleep;
+    else {
+      awakeMin = 0; for (let m = sleep.start; m < sleep.end; m++) if ((N.motion.get(m) || 0) > MOVE_AWAKE) awakeMin++;
+      sleep.asleep = Math.max(0, Math.min(sleep.asleep, sleep.end - sleep.start - awakeMin));
+    }
     perf = Math.min(100, sleep.asleep / 60 / profile.sleepNeed * 100);
     const ts = night.filter((s) => s.t >= sleep.start * 60 && s.t < sleep.end * 60 && s.st > 20 && s.st < 42).map((s) => s.st);
     temp = Stats.median(ts);
@@ -343,12 +393,14 @@ function analyzeDay(dayStartSec, nowSec, secs, profile, prior) {
   const rhrVO = Stats.median(bRHR.concat(rhr != null ? [rhr] : []));
   const rec = hrv != null && rhr != null ? Recovery.compute(hrv, rhr, bHRV, bRHR) : null;
   const bT = prior.map((d) => d.temp).filter((x) => x != null);
-  let counter = 0, prev = null;
-  for (const s of day) { if (s.c != null) { if (prev != null && s.c > prev) counter += s.c - prev; prev = s.c; } }
+  const counter = Math.round(Steps.ticks(day) * (profile.stepScale || 1));
+  let latest = null; for (let i = day.length - 1; i >= 0; i--) if (day[i].hr > 0) { latest = day[i]; break; }
+  const rhrNights = bRHR.concat(rhr != null ? [rhr] : []);
+  const fitAge = rhrNights.length >= 7 ? Fitness.fitnessAge(profile.age, profile.sex, Stats.median(rhrNights)) : null;
   return {
     sleep, rhr, hrv, perf, awakeMin, temp, tempDev: temp != null && bT.length >= 3 ? temp - Stats.median(bT) : null,
     strain: Strain.score(trimp), trimp, kcal, vo2: rhrVO != null ? Fitness.vo2(maxHR(profile), rhrVO) : null,
-    recovery: rec, counter, hrMinutes: D.minutes.length, dayMinutes: D.minutes, nightMinutes: N.minutes, nightMotion: N.motion,
+    recovery: rec, counter, latest, fitAge, rhrNights: rhrNights.length, hrMinutes: D.minutes.length, dayMinutes: D.minutes, nightMinutes: N.minutes, nightMotion: N.motion,
   };
 }
 /*METRICS-END*/
@@ -358,8 +410,13 @@ const DB = {
   db: null,
   open() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open("whooplocal", 1);
-      r.onupgradeneeded = () => { const d = r.result; d.createObjectStore("sec", { keyPath: "t" }); d.createObjectStore("days", { keyPath: "day" }); };
+      const r = indexedDB.open("whooplocal", 2);
+      r.onupgradeneeded = () => {
+        const d = r.result;
+        if (!d.objectStoreNames.contains("sec")) d.createObjectStore("sec", { keyPath: "t" });
+        if (!d.objectStoreNames.contains("days")) d.createObjectStore("days", { keyPath: "day" });
+        if (!d.objectStoreNames.contains("raw")) d.createObjectStore("raw", { keyPath: "t" });
+      };
       r.onsuccess = () => { DB.db = r.result; res(); };
       r.onerror = () => rej(r.error);
     });
@@ -378,12 +435,13 @@ const DB = {
     });
   },
   all(store) { return new Promise((res, rej) => { const q = DB.db.transaction(store).objectStore(store).getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
+  deleteBelow(store, hi) { return new Promise((res) => { const tx = DB.db.transaction(store, "readwrite"); tx.objectStore(store).delete(IDBKeyRange.upperBound(hi, true)); tx.oncomplete = () => res(); tx.onerror = () => res(); }); },
   count(store) { return new Promise((res) => { const q = DB.db.transaction(store).objectStore(store).count(); q.onsuccess = () => res(q.result); }); },
   edge(store, dir) { return new Promise((res) => { const q = DB.db.transaction(store).objectStore(store).openCursor(null, dir); q.onsuccess = () => res(q.result ? q.result.value : null); }); },
 };
 
 // ---------------- Profile ----------------
-const DEFAULT_PROFILE = { age: 30, sex: "male", weight: 75, height: 175, maxHR: 0, sleepNeed: 8 };
+const DEFAULT_PROFILE = { age: 30, sex: "male", weight: 75, height: 175, maxHR: 0, sleepNeed: 8, stepScale: 1 };
 function loadProfile() { try { return { ...DEFAULT_PROFILE, ...JSON.parse(localStorage.getItem("profile") || "{}") }; } catch { return { ...DEFAULT_PROFILE }; } }
 function hasProfile() { try { return !!localStorage.getItem("profile"); } catch { return false; } }
 let profile = loadProfile();
@@ -405,7 +463,9 @@ function ring(el, frac, color, value, label) {
 function tile(k, v, u, n) { return `<div class="tile"><div class="k">${k}</div><div class="v">${v}<span class="u">${u || ""}</span></div>${n ? `<div class="n">${n}</div>` : ""}</div>`; }
 const cssCol = (c) => (typeof c === "string" && c.startsWith("var(") ? getComputedStyle(document.documentElement).getPropertyValue(c.slice(4, -1)).trim() : c);
 function chart(canvas, series, opts = {}) {
-  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = +canvas.getAttribute("height");
+  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth;
+  if (!canvas.dataset.h) canvas.dataset.h = canvas.getAttribute("height"); // fixed CSS height; canvas.height below is the backing store
+  const H = +canvas.dataset.h;
   canvas.width = W * dpr; canvas.height = H * dpr; canvas.style.height = H + "px";
   const g = canvas.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
   const pts = series.flatMap((s) => s.points); if (!pts.length) { g.fillStyle = "#8d949e"; g.font = "13px -apple-system"; g.fillText("No data yet", 10, 24); return; }
@@ -458,10 +518,12 @@ async function recompute(fromDay) {
 
 async function renderAll() {
   const now = new Date(), key = dayKey(now), ds = startOfDay(now).getTime() / 1000;
-  const secs = await DB.range("sec", ds - 6 * 3600, ds + 86400);
+  const nowS = Math.floor(Date.now() / 1000);
+  const secs = await DB.range("sec", Math.min(ds - 6 * 3600, nowS - 86400), ds + 86400);
   const days = (await DB.all("days")).sort((a, b) => (a.day < b.day ? -1 : 1));
   const prior = days.filter((x) => x.day < key).reverse().slice(0, 30);
-  const a = secs.length ? analyzeDay(ds, Math.floor(Date.now() / 1000), secs, profile, prior) : null;
+  const a = secs.length ? analyzeDay(ds, nowS, secs, profile, prior) : null;
+  const last24 = minutesFrom(secs.filter((x) => x.t >= nowS - 86400)).minutes;
   lastToday = a;
   $("todayTitle").textContent = now.toLocaleDateString([], { weekday: "long", day: "numeric", month: "short" });
   const lastSync = localStorage.getItem("lastSync");
@@ -473,19 +535,25 @@ async function renderAll() {
   else ring($("rRec"), 0, "#5c636d", "–", "Recovery");
   ring($("rStrain"), (a?.strain || 0) / 21, "var(--blue)", a ? a.strain.toFixed(1) : "–", "Strain");
   ring($("rSleep"), (a?.perf || 0) / 100, "var(--sleep)", a?.perf != null ? Math.round(a.perf) + "%" : "–", "Sleep");
+  let batt = null, battT = null; try { batt = localStorage.getItem("battery"); battT = localStorage.getItem("batteryTime"); } catch {}
+  const lt = a?.latest;
   $("todayTiles").innerHTML =
+    tile("Latest HR", lt ? String(lt.hr) : "–", "bpm", lt ? "at " + new Date(lt.t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "") +
+    tile("Strap battery", batt != null ? batt : "–", batt != null ? "%" : "", battT ? "at last sync " + new Date(+battT).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "read on sync") +
     tile("Resting HR", fmt(a?.rhr), "bpm") + tile("HRV", fmt(a?.hrv), "ms") +
     tile("Calories", fmt(a?.kcal.total), "kcal", a ? `${Math.round(a.kcal.active)} active` : "") +
     tile("VO₂max est.", fmt(a?.vo2, 1), "ml/kg/min") +
     tile("Skin temp", a?.tempDev != null ? (a.tempDev >= 0 ? "+" : "") + a.tempDev.toFixed(1) : fmt(a?.temp, 1), a?.tempDev != null ? "°C vs base" : "°C", a?.tempDev == null && a?.temp != null ? "baseline after 3 nights" : "") +
-    tile("Activity count", a ? String(a.counter) : "–", "", "strap counter · likely steps");
-  chart($("cToday"), [{ points: (a?.dayMinutes || []).map((m) => [m.m, m.bpm]), color: "var(--red)", axis: true, gap: 10 }],
-    { x0: ds / 60, x1: ds / 60 + 1440, xLabels: [[ds / 60, "00"], [ds / 60 + 360, "06"], [ds / 60 + 720, "12"], [ds / 60 + 1080, "18"], [ds / 60 + 1410, "24"]] });
+    tile("Steps", a ? a.counter.toLocaleString() : "–", "", "strap counter" + ((profile.stepScale || 1) !== 1 ? ` × ${profile.stepScale}` : " · uncalibrated")) +
+    tile("Fitness age", a?.fitAge != null ? Math.round(a.fitAge) : "–", a?.fitAge != null ? "yrs" : "", a?.fitAge != null ? `vs ${profile.age} actual · HUNT method` : `calibrating ${Math.min(a?.rhrNights || 0, 7)}/7 nights`);
+  const e1 = Math.floor(nowS / 60), e0 = e1 - 1440, hh = (m) => new Date(m * 60000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  chart($("cToday"), [{ points: last24.map((m) => [m.m, m.bpm]), color: "var(--red)", axis: true, gap: 10 }],
+    { x0: e0, x1: e1, xLabels: [[e0, hh(e0)], [e0 + 480, hh(e0 + 480)], [e0 + 960, hh(e0 + 960)], [e1 - 40, "now"]] });
   // Sleep
   const s = a?.sleep;
-  $("sleepSub").textContent = s ? `${clock(s.start)} – ${clock(s.end)} · in bed ${hm(s.end - s.start)}` : "No sleep detected yet — wear the strap overnight, then sync in the morning.";
+  $("sleepSub").textContent = s ? `${clock(s.start)} – ${clock(s.end)} · in bed ${hm(s.end - s.start)} · from ${s.source === "strap" ? "the strap's own sleep detection" : "heart rate"}` : "No sleep detected yet — wear the strap overnight, then sync in the morning.";
   $("sleepTiles").innerHTML = tile("Asleep", s ? hm(s.asleep) : "–", "", a?.perf != null ? `${Math.round(a.perf)}% of ${profile.sleepNeed} h need` : "") +
-    tile("Awake / restless", s ? String(a.awakeMin) : "–", "min") + tile("Resting HR", fmt(a?.rhr), "bpm") + tile("HRV", fmt(a?.hrv), "ms");
+    tile("Awake in bed", s ? String(a.awakeMin) : "–", "min") + tile("Resting HR", fmt(a?.rhr), "bpm") + tile("HRV", fmt(a?.hrv), "ms");
   if (s) {
     const mins = a.nightMinutes.filter((m) => m.m >= s.start - 30 && m.m < s.end + 30);
     const mv = []; for (let m = s.start - 30; m < s.end + 30; m++) if (a.nightMotion.has(m)) mv.push([m, Math.min(15, a.nightMotion.get(m))]);
@@ -501,9 +569,9 @@ async function renderAll() {
     ["Recovery %", "recovery", "bar", null, recColor, 0, 100],
     ["HRV (ms)", "hrv", "line", "var(--green)"], ["Resting HR (bpm)", "rhr", "line", "var(--red)"],
     ["Sleep (hours)", "asleep", "bar", "var(--sleep)", null, 0, null, (v) => v / 60], ["Strain", "strain", "bar", "var(--blue)", null, 0, 21],
-    ["Calories (kcal)", "kcal", "bar", "var(--orange)", null, 0], ["Skin temp (°C)", "temp", "line", "var(--temp)"], ["Activity count", "counter", "bar", "#9aa0a6", null, 0],
+    ["Calories (kcal)", "kcal", "bar", "var(--orange)", null, 0], ["Skin temp (°C)", "temp", "line", "var(--temp)"], ["Steps", "counter", "bar", "#9aa0a6", null, 0],
   ];
-  $("trendCards").innerHTML = defs.map((d, i) => `<div class="card"><h2>${d[0]}</h2><canvas id="tc${i}" height="120"></canvas></div>`).join("");
+  $("trendCards").innerHTML = defs.map((d, i) => `<div class="card"><h2>${d[0]}</h2><canvas id="tc${i}" height="90"></canvas></div>`).join("");
   defs.forEach((d, i) => {
     const pts = last.filter((x) => x[d[1]] != null).map((x) => [T(x), d[7] ? d[7](x[d[1]]) : x[d[1]]]);
     chart($("tc" + i), [{ points: pts, type: d[2], color: d[3], colorFn: d[4], min: d[5], max: d[6] ?? undefined, axis: true, dots: d[2] === "line", barW: 10 }],
@@ -527,15 +595,21 @@ async function sync() {
   $("bSync").disabled = true; let device;
   try {
     setStatus("choose your strap…", "warn");
-    device = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: "WHOOP" }], optionalServices: [SVC] });
+    device = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: "WHOOP" }], optionalServices: [SVC, "battery_service"] });
     setStatus("connecting…", "warn");
     const gatt = await device.gatt.connect();
     $("sStrap").textContent = device.name; log("connected to " + device.name, "ok");
+    try {
+      const bc = await (await gatt.getPrimaryService("battery_service")).getCharacteristic("battery_level");
+      const pct = (await bc.readValue()).getUint8(0);
+      localStorage.setItem("battery", String(pct)); localStorage.setItem("batteryTime", String(Date.now()));
+      $("sBatt").textContent = pct + "%"; log("strap battery " + pct + "%");
+    } catch (e) { log("battery read failed: " + e.message, "warn"); }
     const svc = await gatt.getPrimaryService(SVC);
     const cmdChar = await svc.getCharacteristic(CMD_TO);
     const write = (cmd, payload) => cmdChar.writeValueWithResponse(encode(cmd, payload));
     // State for this sync
-    let batch = [], saved = 0, ends = [], done = false, lastRx = Date.now(), firstTs = null, lastTs = null, helloOK = false, evStart = null;
+    let batch = [], rawBatch = [], saved = 0, ends = [], done = false, lastRx = Date.now(), firstTs = null, lastTs = null, helloOK = false, evStart = null;
     const onFrame = ({ f, raw }) => {
       const { pt, seq, cmd, p } = f;
       if ((pt === 36 || pt === 38) && cmd === CMD.HELLO && /[0-9][A-Z][0-9]{8}/.test(String.fromCharCode(...p))) helloOK = true;
@@ -543,7 +617,7 @@ async function sync() {
         lastRx = Date.now();
         if (seq === 18) {
           const r = parseV18(raw);
-          if (r && r.t > 1.6e9 && r.t < 2.1e9) { batch.push(r); lastTs = r.t; firstTs ??= r.t; $("sDate").textContent = new Date(r.t * 1000).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); }
+          if (r && r.t > 1.6e9 && r.t < 2.1e9) { batch.push(r); rawBatch.push({ t: r.t, b: raw }); lastTs = r.t; firstTs ??= r.t; $("sDate").textContent = new Date(r.t * 1000).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); }
         }
       } else if (pt === 48 && p.length >= 5) {
         lastRx = Date.now();
@@ -575,14 +649,15 @@ async function sync() {
     while (!done) {
       if (acked < ends.length) {
         // Persist everything received so far BEFORE acknowledging — acknowledged data is released by the strap.
-        const rows = batch; batch = [];
-        if (rows.length) { await DB.putMany("sec", rows); saved += rows.length; $("sNew").textContent = saved.toLocaleString(); }
+        const rows = batch, raws = rawBatch; batch = []; rawBatch = [];
+        if (rows.length) { await DB.putMany("sec", rows); await DB.putMany("raw", raws); saved += rows.length; $("sNew").textContent = saved.toLocaleString(); }
         await write(CMD.HIST_RESULT, [0x01, ...ends[acked]]); acked++;
         lastRx = Date.now();
       } else if (Date.now() - lastRx > 20000) { log("no data for 20 s — stopping", "warn"); break; }
       await sleepMs(60);
     }
-    if (batch.length) { await DB.putMany("sec", batch); saved += batch.length; batch = []; }
+    if (batch.length) { await DB.putMany("sec", batch); await DB.putMany("raw", rawBatch); saved += batch.length; batch = []; rawBatch = []; }
+    await DB.deleteBelow("raw", Math.floor(Date.now() / 1000) - 7 * 86400);
     try { await write(CMD.ABORT_HIST); await write(CMD.EXIT_HF); } catch {}
     $("pbar").style.width = "100%";
     log(`sync ${done ? "complete" : "stopped"} — ${acked} batches, ${saved} new records`, done ? "ok" : "warn");
@@ -617,10 +692,12 @@ async function importCSV(file) {
 }
 async function exportCSV() {
   const all = await DB.all("sec");
-  const lines = ["unix_ts,local_time,hr_bpm,rr_ms,gx,gy,gz,counter,skin_temp_c"];
-  for (const r of all) lines.push([r.t, new Date(r.t * 1000).toISOString(), r.hr || "", (r.rr || []).join(" "), ...(r.g || ["", "", ""]), r.c ?? "", r.st ?? ""].join(","));
-  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `whooplocal_${dayKey(new Date())}.csv`; a.click();
+  const lines = ["unix_ts,local_time,hr_bpm,rr_ms,gx,gy,gz,counter,skin_temp_c,dyn_accel_g,activity_class,strap_sleep_state,on_wrist"];
+  for (const r of all) lines.push([r.t, new Date(r.t * 1000).toISOString(), r.hr || "", (r.rr || []).join(" "), ...(r.g || ["", "", ""]), r.c ?? "", r.st ?? "", r.da ?? "", r.act ?? "", r.ss ?? "", r.ow ?? ""].join(","));
+  const name = `whooplocal_${dayKey(new Date())}.csv`, blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  const file = new File([blob], name, { type: "text/csv" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: name }); log(`shared ${all.length} records`); return; } catch (e) { if (e.name === "AbortError") return; } }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   log(`exported ${all.length} records`);
 }
 
@@ -636,9 +713,9 @@ $("bExport").onclick = exportCSV;
 $("bImport").onclick = () => $("fImport").click();
 $("fImport").onchange = (e) => e.target.files[0] && importCSV(e.target.files[0]);
 $("bCopyLog").onclick = async () => { try { await navigator.clipboard.writeText(logLines.join("\n")); log("log copied"); } catch { log("copy failed"); } };
-function fillProfile() { $("pAge").value = profile.age; $("pSex").value = profile.sex; $("pWeight").value = profile.weight; $("pHeight").value = profile.height; $("pMaxHR").value = profile.maxHR; $("pSleep").value = profile.sleepNeed; }
+function fillProfile() { $("pAge").value = profile.age; $("pSex").value = profile.sex; $("pWeight").value = profile.weight; $("pHeight").value = profile.height; $("pMaxHR").value = profile.maxHR; $("pSleep").value = profile.sleepNeed; $("pStep").value = profile.stepScale ?? 1; }
 $("bSaveProfile").onclick = async () => {
-  profile = { age: +$("pAge").value || 30, sex: $("pSex").value, weight: +$("pWeight").value || 75, height: +$("pHeight").value || 175, maxHR: +$("pMaxHR").value || 0, sleepNeed: +$("pSleep").value || 8 };
+  profile = { age: +$("pAge").value || 30, sex: $("pSex").value, weight: +$("pWeight").value || 75, height: +$("pHeight").value || 175, maxHR: +$("pMaxHR").value || 0, sleepNeed: +$("pSleep").value || 8, stepScale: +$("pStep").value || 1 };
   try { localStorage.setItem("profile", JSON.stringify(profile)); } catch {}
   log("profile saved"); await recompute(); show("today");
 };
